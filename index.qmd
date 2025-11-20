@@ -125,7 +125,7 @@ There are really two different problems:
 end
 ```
 
-(BTW, we probably want to parallelise that likelihood...)
+(BTW, we probably want to parallelise that likelihood... and also not specify `resp` as a model parameter, but rather condition on it. But let's ignore that for now.)
 
 When you sample from this model, you'll get each parameter as a separate variable.
 
@@ -167,9 +167,9 @@ summarystats(chain)
 
 Of course, instead of a NamedTuple we could also use a `DimensionalData.DimVector` or something like that (see e.g. [here](https://pysm.dev/FlexiChains.jl/stable/integrations/#DimensionalDistributions.jl)).
 
-So that's the first question, which is what is our target model code.
+So that's the first question, i.e., _what_ is the code that we are trying to generate.
 
-The second problem is how do we actually turn the `TuringModelSpec` into that code.
+The second problem is _how_ do we actually turn the `TuringModelSpec` into that code.
 
 This is very tricky, because model functions are just Julia functions.
 You can't really go into a Julia function and dynamically add new statements to it (unless you do it at the SSA IR level, like what Mooncake does, but that feels way too complicated for our purposes here).
@@ -182,6 +182,7 @@ interpolate the contents of `tms::TuringModelSpec` into an expression that defin
 This is closer to what brms does since it has to generate Stan code.
 
 I think this will likely be the more performant and also flexible option, albeit probably harder to write and maintain.
+(But we're all clever programmers here, so that shouldn't be too much of a problem, right?)
 
 Something like this:
 
@@ -260,7 +261,10 @@ This is closer in spirit to what TuringGLM does, except that TuringGLM is lazy a
 I assume we don't want to do that.
 
 The main issue with this is that `~` expands to a fair bit more than just `tilde_assume!!`, and we would have to essentially replicate a lot of the behaviour of `~` to retain that functionality.
-For example, `tilde_assume!!` doesn't check if the variable has been conditioned on so the following won't allow for conditioning:
+For example, `tilde_assume!!` doesn't check if the variable has been conditioned on so the following won't allow for conditioning.
+
+Also, judging by the results of the sampling, I'm sure I've messed something up in the implementation.
+But also I think this is the inferior approach, so I don't feel like I really care enough to fix it.
 
 ```{julia}
 using DynamicPPL
@@ -271,6 +275,8 @@ using DynamicPPL
         val, __varinfo__ = DynamicPPL.tilde_assume!!(__model__.context, p.prior, VarName{p.param_name}(), __varinfo__)
         coeffs[p.param_name] = val
     end
+    # This is quite ugly, we can't initialise µ = zeros(size(resp))
+    # as that breaks ForwardDiff
     µ = coeffs[tms.predictors[1].param_name] .* pred[:, 1]
     for (j, p) in enumerate(tms.predictors[2:end])
         µ .+= coeffs[p.param_name] .* pred[:, j]
