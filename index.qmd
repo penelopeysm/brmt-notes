@@ -106,6 +106,8 @@ poisson_response(µ) = Poisson(exp(µ))
 tms = TuringModelSpec(f, poisson_response, (; b_Treatment = Normal(0, 10)))
 ```
 
+Here `poisson_response(µ)` returns a distribution, but it should be easy enough to generalise the API to allow users to pass e.g. submodels, or just a straight up likelihood function that returns a float.
+
 ## From TuringModelSpec to Turing model
 
 Now, the problem is how we convert this specification into a Turing model.
