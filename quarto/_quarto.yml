@@ -1,0 +1,13 @@
+project:
+  type: book
+
+book:
+  title: "brmt"
+  author: "Penelope Yong"
+  date: "2025-11-19"
+  chapters:
+    - index.qmd
+
+format:
+  html:
+    theme: cosmo

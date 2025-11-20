@@ -1,0 +1,262 @@
+---
+engine: julia
+---
+
+```{julia}
+import Pkg; Pkg.status()
+```
+
+## Bayesian regression
+
+Start by loading some data.
+I've chosen this dataset since it's the same as the one used in the introduction of https://paulbuerkner.com/software/brms-book/brms-book.pdf.
+
+```{julia}
+using RDatasets: dataset, Not
+
+# Load the epilepsy dataset and select only the rows where Period is "1"
+full_df = dataset("HSAUR", "epilepsy")
+df = full_df[full_df.Period .== "1", Not("Period")]
+df
+```
+
+## Formula
+
+Presumably, we want to keep using StatsModels.jl as that does a lot of heavy lifting in terms of parsing formulas and constructing the data matrices.
+
+```{julia}
+# Define the formula
+using StatsModels
+f = @formula(SeizureRate ~ 1 + Treatment)
+
+# Get the data
+schema(f, df)
+a = apply_schema(f, schema(f, df))
+resp, pred = modelcols(a, df)
+```
+
+## Formula to Turing model specification
+
+The formula alone doesn't contain enough information to specify our model.
+At the very least we need to be able to say:
+
+- what the priors are for each coefficient
+
+- how the linear predictor µ maps to the likelihood (i.e., the link function)
+
+Obviously, the interface can be fine tuned, but in terms of data structures this is probably our first step.
+
+```{julia}
+using Turing
+
+# Wrapper around each individual predictor.
+struct TuringPredictor{T<:StatsModels.AbstractTerm,D<:Distribution}
+    # this is lifted from the formula
+    term::T
+    # this is the name of the parameter in the Turing model
+    param_name::Symbol
+    # prior distribution for this parameter
+    prior::D
+end
+Base.show(io::IO, tp::TuringPredictor) = print(io, "$(tp.param_name) ~ $(tp.prior)")
+
+# This struct holds the full model specification
+struct TuringModelSpec{V<:Vector{<:TuringPredictor}}
+    # lhs of the formula
+    likelihood_term::Term
+    # this must take a single argument (the linear predictor) and return a
+    # distribution
+    link_function::Function
+    # collection of predictors
+    predictors::V
+end
+function Base.show(io::IO, tms::TuringModelSpec)
+    println(io, "Likelihood:\n  $(tms.likelihood_term) ~ $(tms.link_function)(µ)")
+    println(io, "Predictors:")
+    for p in tms.predictors
+        println(io, "  ", p)
+    end
+end
+
+# This is quite crude
+make_param_name(t::ConstantTerm) = :Intercept
+make_param_name(t::Term) = Symbol("b_$(t.sym)")
+
+function TuringModelSpec(
+    f::StatsModels.FormulaTerm,
+    link_function::Function,
+    priors::NamedTuple=NamedTuple()
+)
+    # f.lhs contains the response
+    likelihood_term = f.lhs
+    # associate each predictor with its prior
+    predictors = map(f.rhs) do term
+        param_name = make_param_name(term)
+        prior = get(priors, param_name, Flat())
+        TuringPredictor(term, param_name, prior)
+    end
+    TuringModelSpec(likelihood_term, link_function, collect(predictors))
+end
+
+# Usage:
+poisson_link(µ) = Poisson(exp(µ))
+tms = TuringModelSpec(f, poisson_link, (; b_Treatment = Normal(0, 10)))
+```
+
+## From TuringModelSpec to Turing model
+
+Now, the problem is how we convert this specification into a Turing model.
+
+There are really two different problems:
+
+1. What is the most performant and also user-friendly way to write the model? Performant obviously means fast. As for user-friendliness, consider the following:
+
+```{julia}
+@model function fishmodel_separate(resp, pred)
+    Intercept ~ Flat()
+    b_Treatment ~ Normal(0, 10)
+    µ = @. Intercept * pred[:, 1] + b_Treatment * pred[:, 2]
+    for i in eachindex(resp)
+        resp[i] ~ poisson_link(µ[i])
+    end
+end
+```
+
+(BTW, we probably want to parallelise that likelihood...)
+
+When you sample from this model, you'll get each parameter as a separate variable.
+
+```{julia}
+using FlexiChains
+model = fishmodel_separate(resp, pred)
+chain = sample(model, NUTS(), 1000; chain_type=VNChain, progress=false)
+```
+
+But we could also have written the model like this:
+
+```{julia}
+@model function fishmodel_product(resp, pred)
+    predictors ~ product_distribution((Intercept=Flat(), b_Treatment=Normal(0, 10)))
+    µ = @. predictors[1] * pred[:, 1] + predictors[2] * pred[:, 2]
+    for i in eachindex(resp)
+        resp[i] ~ poisson_link(µ[i])
+    end
+end
+```
+
+And then when we sample from this, we'd get a single variable `predictors` that is a NamedTuple containing all the parameters.
+
+```{julia}
+using FlexiChains
+model = fishmodel_product(resp, pred)
+chain = sample(model, NUTS(), 1000; chain_type=VNChain, progress=false)
+```
+
+The second problem is how do we actually turn the `TuringModelSpec` into a Turing model function.
+
+This is very tricky, because model functions are just Julia functions.
+You can't really go into a Julia function and dynamically add new statements to it (unless you do it at the SSA IR level, like what Mooncake does, but that feels way too complicated for our purposes here).
+
+There are two options that I can think of (although I haven't thought _too_ much):
+
+### (a) generate code and `eval` it
+
+interpolate the contents of `tms::TuringModelSpec` into an expression that defines the model function, and then `eval` that.
+This is closer to what brms does since it has to generate Stan code.
+
+Something like this:
+
+```{julia}
+predictors_expr = Expr(:block)
+for p in tms.predictors
+    push!(predictors_expr.args, :( $(p.param_name) ~ $(p.prior) ))
+end
+µ_expr = :( $(tms.predictors[1].param_name) * pred[:, 1] )
+for (j, p) in enumerate(tms.predictors[2:end])
+    µ_expr = :( $µ_expr + ($(p.param_name) * pred[:, $(j+1)]) )
+end
+expr = quote
+    @model function fishmodel_generated(resp, pred)
+        $(predictors_expr.args...)
+        µ = @. $µ_expr
+        for i in eachindex(resp)
+            resp[i] ~ $(tms.link_function)(µ[i])
+        end
+    end
+end
+Base.remove_linenums!(expr)
+expr
+```
+
+```{julia}
+@eval $expr
+generated_model = fishmodel_generated(resp, pred)
+sample(generated_model, NUTS(), 1000; chain_type=VNChain, progress=false)
+```
+
+Note that for this approach we might not want to go straight from a TuringModelSpec to a model function.
+We could also go via an intermediate representation, something like:
+
+```julia
+abstract type AbstractModelExpr end
+
+struct TildeStatement <: AbstractModelExpr
+    param_name::Symbol
+    prior::Distribution
+end
+to_expr(ts::TildeStatement) = :( $(ts.param_name) ~ $(ts.prior) )
+
+struct OtherExpr <: AbstractModelExpr
+    expr::Expr
+end
+to_expr(oe::OtherExpr) = oe.expr
+
+struct TuringModelExpr
+    statements::Vector{AbstractModelExpr}
+    # need more fields for arguments, retval, ...
+end
+
+function to_model(tme::TuringModelExpr)
+    stmts_expr = Expr(:block, map(to_expr, tme.statements)...)
+    @eval quote
+        @model function model(resp, pred)
+            $stmts_expr
+        end
+    end
+end
+```
+
+then instead of converting `TuringModelSpec` directly to a model function, we convert it to `TuringModelExpr` first.
+
+### (b) pass `tms` as an argument
+
+We could pass `tms` as an argument to a generic model function, and then use lower-level functions to achieve the same effect.
+This is sort of like generating the desugared `@model` output, which means that we don't have to use `eval`.
+
+This is closer in spirit to what TuringGLM does, except that TuringGLM is lazy and doesn't put the parameter names on the LHS of tildes, meaning that you just get a vector of `β` coefficients whose order is not immediately obvious.
+I assume we don't want to do that.
+
+The main issue with this is that `~` expands to a fair bit more than just `tilde_assume!!`, and we would have to essentially replicate a lot of the behaviour of `~` to retain that functionality.
+For example, `tilde_assume!!` doesn't check if the variable has been conditioned on so the following won't allow for conditioning:
+
+```{julia}
+using DynamicPPL
+
+@model function model_generic(tms::TuringModelSpec, resp, pred)
+    coeffs = Dict{Symbol, Any}()
+    for p in tms.predictors
+        val, __varinfo__ = DynamicPPL.tilde_assume!!(__model__.context, p.prior, VarName{p.param_name}(), __varinfo__)
+        coeffs[p.param_name] = val
+    end
+    µ = coeffs[tms.predictors[1].param_name] .* pred[:, 1]
+    for (j, p) in enumerate(tms.predictors[2:end])
+        µ .+= coeffs[p.param_name] .* pred[:, j]
+    end
+    # likelihood
+    for i in eachindex(resp)
+        resp[i] ~ tms.link_function(µ[i])
+    end
+end
+generic = model_generic(tms, resp, pred)
+sample(generic, NUTS(), 1000; chain_type=VNChain, progress=false)
+```

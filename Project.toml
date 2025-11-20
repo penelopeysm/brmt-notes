@@ -1,0 +1,12 @@
+name = "Brmt"
+uuid = "23c26b82-d9ea-4388-9a8e-bf14246ce184"
+authors = ["Penelope Yong <penelopeysm@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+StatsModels = "3eaba693-59b7-5ba5-a881-562e759f1c8d"
+Turing = "fce5fe82-541a-59a6-adf8-730c64b5f9a0"
+
+[compat]
+StatsModels = "0.7.7"
+Turing = "0.41.1"
