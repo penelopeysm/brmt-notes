@@ -24,6 +24,8 @@ df
 
 Presumably, we want to keep using StatsModels.jl as that does a lot of heavy lifting in terms of parsing formulas and constructing the data matrices.
 
+I don't actually know what this does, I just copied it from [the docs](https://juliastats.org/StatsModels.jl/stable/formula/).
+
 ```{julia}
 # Define the formula
 using StatsModels
@@ -42,9 +44,9 @@ At the very least we need to be able to say:
 
 - what the priors are for each coefficient
 
-- how the linear predictor µ maps to the likelihood (i.e., the link function)
+- how the linear predictor µ maps to the likelihood (i.e., the response function)
 
-Obviously, the interface can be fine tuned, but in terms of data structures this is probably our first step.
+Obviously, the interface can be fine tuned, but in terms of data structures our first step is probably to augment the StatsModels formula with this information.
 
 ```{julia}
 using Turing
@@ -66,12 +68,12 @@ struct TuringModelSpec{V<:Vector{<:TuringPredictor}}
     likelihood_term::Term
     # this must take a single argument (the linear predictor) and return a
     # distribution
-    link_function::Function
+    response_function::Function
     # collection of predictors
     predictors::V
 end
 function Base.show(io::IO, tms::TuringModelSpec)
-    println(io, "Likelihood:\n  $(tms.likelihood_term) ~ $(tms.link_function)(µ)")
+    println(io, "Likelihood:\n  $(tms.likelihood_term) ~ $(tms.response_function)(µ)")
     println(io, "Predictors:")
     for p in tms.predictors
         println(io, "  ", p)
@@ -84,7 +86,7 @@ make_param_name(t::Term) = Symbol("b_$(t.sym)")
 
 function TuringModelSpec(
     f::StatsModels.FormulaTerm,
-    link_function::Function,
+    response_function::Function,
     priors::NamedTuple=NamedTuple()
 )
     # f.lhs contains the response
@@ -92,15 +94,16 @@ function TuringModelSpec(
     # associate each predictor with its prior
     predictors = map(f.rhs) do term
         param_name = make_param_name(term)
+        # we could have more 'intelligent' default priors too
         prior = get(priors, param_name, Flat())
         TuringPredictor(term, param_name, prior)
     end
-    TuringModelSpec(likelihood_term, link_function, collect(predictors))
+    TuringModelSpec(likelihood_term, response_function, collect(predictors))
 end
 
 # Usage:
-poisson_link(µ) = Poisson(exp(µ))
-tms = TuringModelSpec(f, poisson_link, (; b_Treatment = Normal(0, 10)))
+poisson_response(µ) = Poisson(exp(µ))
+tms = TuringModelSpec(f, poisson_response, (; b_Treatment = Normal(0, 10)))
 ```
 
 ## From TuringModelSpec to Turing model
@@ -117,7 +120,7 @@ There are really two different problems:
     b_Treatment ~ Normal(0, 10)
     µ = @. Intercept * pred[:, 1] + b_Treatment * pred[:, 2]
     for i in eachindex(resp)
-        resp[i] ~ poisson_link(µ[i])
+        resp[i] ~ poisson_response(µ[i])
     end
 end
 ```
@@ -143,7 +146,7 @@ But we could also have written the model like this:
     predictors ~ product_distribution((Intercept=Flat(), b_Treatment=Normal(0, 10)))
     µ = @. predictors[1] * pred[:, 1] + predictors[2] * pred[:, 2]
     for i in eachindex(resp)
-        resp[i] ~ poisson_link(µ[i])
+        resp[i] ~ poisson_response(µ[i])
     end
 end
 ```
@@ -196,7 +199,7 @@ expr = quote
         $(predictors_expr.args...)
         µ = @. $µ_expr
         for i in eachindex(resp)
-            resp[i] ~ $(tms.link_function)(µ[i])
+            resp[i] ~ $(tms.response_function)(µ[i])
         end
     end
 end
@@ -274,7 +277,7 @@ using DynamicPPL
     end
     # likelihood
     for i in eachindex(resp)
-        resp[i] ~ tms.link_function(µ[i])
+        resp[i] ~ tms.response_function(µ[i])
     end
 end
 generic = model_generic(tms, resp, pred)
