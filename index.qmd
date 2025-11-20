@@ -9,7 +9,7 @@ import Pkg; Pkg.status()
 ## Bayesian regression
 
 Start by loading some data.
-I've chosen this dataset since it's the same as the one used in the introduction of https://paulbuerkner.com/software/brms-book/brms-book.pdf.
+I've chosen this dataset since it's the same as the one used in the introduction of [the brms book](https://paulbuerkner.com/software/brms-book/brms-book.pdf).
 
 ```{julia}
 using RDatasets: dataset, Not
@@ -132,6 +132,10 @@ model = fishmodel_separate(resp, pred)
 chain = sample(model, NUTS(), 1000; chain_type=VNChain, progress=false)
 ```
 
+```{julia}
+summarystats(chain)
+```
+
 But we could also have written the model like this:
 
 ```{julia}
@@ -152,7 +156,17 @@ model = fishmodel_product(resp, pred)
 chain = sample(model, NUTS(), 1000; chain_type=VNChain, progress=false)
 ```
 
-The second problem is how do we actually turn the `TuringModelSpec` into a Turing model function.
+(When displaying summary stats, the NamedTuple will be broken up, but in the original chain it is still stored as a single variable, which may or may not make downstream analysis easier.)
+
+```{julia}
+summarystats(chain)
+```
+
+Of course, instead of a NamedTuple we could also use a `DimensionalData.DimVector` or something like that (see e.g. [here](https://pysm.dev/FlexiChains.jl/stable/integrations/#DimensionalDistributions.jl)).
+
+So that's the first question, which is what is our target model code.
+
+The second problem is how do we actually turn the `TuringModelSpec` into that code.
 
 This is very tricky, because model functions are just Julia functions.
 You can't really go into a Julia function and dynamically add new statements to it (unless you do it at the SSA IR level, like what Mooncake does, but that feels way too complicated for our purposes here).
@@ -163,6 +177,8 @@ There are two options that I can think of (although I haven't thought _too_ much
 
 interpolate the contents of `tms::TuringModelSpec` into an expression that defines the model function, and then `eval` that.
 This is closer to what brms does since it has to generate Stan code.
+
+I think this will likely be the more performant and also flexible option, albeit probably harder to write and maintain.
 
 Something like this:
 
@@ -192,6 +208,10 @@ expr
 @eval $expr
 generated_model = fishmodel_generated(resp, pred)
 sample(generated_model, NUTS(), 1000; chain_type=VNChain, progress=false)
+```
+
+```{julia}
+summarystats(chain)
 ```
 
 Note that for this approach we might not want to go straight from a TuringModelSpec to a model function.
@@ -258,5 +278,9 @@ using DynamicPPL
     end
 end
 generic = model_generic(tms, resp, pred)
-sample(generic, NUTS(), 1000; chain_type=VNChain, progress=false)
+chain = sample(generic, NUTS(), 1000; chain_type=VNChain, progress=false)
+```
+
+```{julia}
+summarystats(chain)
 ```
